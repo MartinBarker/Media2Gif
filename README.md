@@ -73,15 +73,200 @@ The script requires `ffmpeg` to be installed on your system. Follow the instruct
     pip install -r requirements.txt
     ```
 
+## Command Line Flags
+
+```
+--movie: Path to the movie file (required)
+--subtitles: Path to the subtitles file (optional)
+--outputFolder: Output directory for GIFs. If relative path, creates folder in same directory as movie file (default: /mnt/x/28dayslatergifs/)
+--interval: Interval in seconds for GIF generation (default: 5)
+--startTime: Start time for GIF generation in hh:mm:ss format (default: 00:00:00)
+--maxFilesize: Maximum file size for the GIF (e.g., "15mb", "15MB", "15" for 15 megabytes)
+--debug: Enable debug mode to save each iteration of the optimization process
+--randomTimes: Generate GIFs from different random start times
+--noHDR: Remove HDR (convert to SDR) in GIFs
+--boostColors: Boost color contrast/saturation by N percent
+--boostFrameColors: Boost colors of each frame by N percent before making GIF
+--quotes: Whether to include quotes in GIFs (true/false) (default: true)
+--subtitleColor: Color of subtitle text (e.g., "yellow", "white", "red") (default: white)
+--subtitleSize: Size of subtitle text in pixels (default: 16)
+--randomQuote: Pick a random quote or random time. With --quotes true, picks a random quote. With --quotes false, picks a random time based on --interval
+--saveJson: Save a JSON file with metadata for each generated GIF (filename, quote, startTime, endTime)
+--textBorder: Width of black border/stroke around text in pixels (default: 2)
+--textPadding: Padding margin in pixels around text to prevent cropping (default: 5)
+--bottomPadding: Padding from the bottom of the frame for the text in pixels (default: uses textPadding value)
+--uppercase: Convert all text to uppercase
+--italicize: Italicize the text (default: false)
+--trailingPeriod: Keep trailing periods in quotes (true/false). Set to false to remove trailing periods from all quotes (default: true)
+--outputBatchFolderSize: Automatically organize GIFs into batch folders of specified size (e.g., 100). GIFs are saved directly into batch_001, batch_002, etc. folders as they're created (default: None, saves all GIFs in output folder)
+--subtitleTrack: Specify which embedded subtitle track to use by index (use --listSubtitleTracks to see available tracks)
+--listSubtitleTracks: List all available subtitle tracks in the video file and exit
+```
+
+### Embedded Subtitle Track Selection
+If no external subtitle file is provided, the script will automatically detect embedded subtitle tracks in the video file:
+- If **multiple tracks** are found, you will be prompted to select which one to use
+- If **one track** is found, it will be used automatically
+- You can save your selection for future runs when prompted
+
+To list available tracks without running the full script:
+```sh
+python make_gifs.py --movie "$movie_path" --listSubtitleTracks
+```
+
+To specify a track directly:
+```sh
+python make_gifs.py --movie "$movie_path" --subtitleTrack 2 --outputFolder "output"
+```
+
 ## Running the Script
 1. Ensure the virtual environment is activated.
 2. Run the script with the required arguments:
     ```sh
-    python make_gifs.py --movie /path/to/movie.mp4 --subtitles /path/to/subtitles.srt --output /mnt/x/28dayslatergifs --interval 5 --startTime 01:22:23
+    movie_path="/mnt/g/Miracle Mile (1988) [1080p]/Miracle.Mile.1988.1080p.BluRay.x264.YIFY.mp4"
+    python make_gifs.py --movie "$movie_path" --outputFolder "/mnt/c/Users/marti/Documents/projects/Media-To-Gif/output" --interval 5
     ```
 Example:
 ```sh
-python make_gifs.py --movie "media/28 Days Later (2002)/28.Days.Later.2002.720p.mp4" --subtitles "media/28 Days Later (2002)/28.Days.Later.2002.Subtitles.srt" --output /mnt/x/28dayslatergifs --interval 5 --startTime 01:22:23 --maxFilesize 15mb
+movie_path="/mnt/q/movies/28.Years.Later.2025.1080p.AMZN.WEB-DL.DDP5.1.H.264-KyoGo.mkv"
+python make_gifs.py --movie "$movie_path" --outputFolder /mnt/x/28dayslatergifs --interval 5 --startTime 01:22:23 --maxFilesize 15mb
+```
+
+Example with Snake Eyes:
+```sh
+movie_path="/mnt/q/movies/Snake Eyes (1998)/Snake.Eyes.1998.1080p.BluRay.x264.YIFY.mp4"
+
+# save gifs for random quotes and 5 second intervals in-between quotes (default interval = 5 seconds)
+python make_gifs.py \
+--movie "$movie_path" \
+--outputFolder "gifs_only_quote" \
+--quotes true \
+--randomQuote \
+--randomTimes \
+--maxFilesize "15mb" \
+--saveJson \
+--checkHistory
+
+# save gifs for only random quotes - no non-quote output gifs
+python make_gifs.py \
+--movie "$movie_path" \
+--outputFolder "gifs_only_quote_15mb" \
+--quotes true \
+--randomQuote \
+--maxFilesize "15mb" \
+--saveJson
+
+# save gifs for only random non-quotes - no quotes in gif - random times
+python make_gifs.py \
+--movie "$movie_path" \
+--outputFolder "gifs_only_quote" \
+--quotes false \
+--randomQuote
+```
+
+## finale 
+movie_path="/mnt/q/movies/28 Years Later (2025) (2160p iT WEB-DL H265 HDR10+ DDP Atmos 5.1 English - HONE).mkv"
+./venv/bin/python make_gifs.py --movie "$movie_path" --outputFolder /mnt/q/movies/1080p --interval 5 --startTime 01:48:00 --maxFilesize 55
 ```
 
 The script will generate GIFs and save them in the specified output folder.
+
+
+# Test command
+```
+movie_path="/mnt/q/movies/Heat (1995) [1080p]/Heat.1995.1080p.BRrip.x264.YIFY.mp4"
+python make_gifs.py \
+--movie "$movie_path" \
+--outputFolder "gif_output" \
+--quotes true \
+--randomQuote \
+--randomTimes \
+--maxFilesize "15mb" \
+--saveJson \
+--checkHistory \
+--subtitleColor "white" \
+--subtitleSize 45 \
+--textBorder 3 \
+--textPadding 15 \
+--uppercase \
+--randomQuote \
+--randomTimes \
+--maxGifs 10
+```
+
+# Generate gif from entire movie
+```
+movie_path="/mnt/q/movies/Heat (1995) [1080p]/Heat.1995.1080p.BRrip.x264.YIFY.mp4"
+python make_gifs.py \
+--movie "$movie_path" \
+--outputFolder "entire_movie_gifs" \
+--maxFilesize "15mb" \
+--quotes true \
+--saveJson \
+--subtitleColor "white" \
+--subtitleSize 35 \
+--textBorder 3 \
+--textPadding 15 \
+--bottomPadding 20 \
+--uppercase
+```
+
+
+movie_path="/mnt/q/movies/Heat (1995) [1080p]/Heat.1995.1080p.BRrip.x264.YIFY.mp4"
+subtitle_path="/mnt/q/movies/Heat (1995) [1080p]/Heat.1995.1080p.BRrip.x264.YIFY.srt"
+python make_gifs.py \
+--movie "$movie_path" \
+--subtitles "$subtitle_path" \
+--outputFolder "entire_movie_gifs" \
+--maxFilesize "15mb" \
+--quotes true \
+--saveJson \
+--subtitleColor "white" \
+--subtitleSize 35 \
+--textBorder 3 \
+--textPadding 15 \
+--bottomPadding 20 \
+--uppercase 
+
+
+```Avatar
+
+movie_path="/mnt/q/movies/Avatar The Way Of Water (2022) [1080p] [WEBRip] [5.1] [YTS.MX]/Avatar.The.Way.Of.Water.2022.1080p.WEBRip.x264.AAC5.1-[YTS.MX].mp4"
+subtitle_path="/mnt/q/movies/Avatar The Way Of Water (2022) [1080p] [WEBRip] [5.1] [YTS.MX]/Avatar.The.Way.Of.Water.2022.1080p.WEBRip.x264.AAC5.1-[YTS.MX].srt"
+
+python make_gifs.py \
+--movie "$movie_path" \
+--subtitles "$subtitle_path" \
+--outputFolder "entire_movie_gifs" \
+--maxFilesize "15mb" \
+--quotes true \
+--saveJson \
+--subtitleColor "white" \
+--subtitleSize 35 \
+--textBorder 3 \
+--textPadding 15 \
+--bottomPadding 20 \
+--uppercase \
+--trailingPeriod false \
+--outputBatchFolderSize 100
+
+```
+
+# Hard Boiled - 20 random quote gifs
+```
+movie_path="/mnt/q/movies/Hard Boiled (1992)/Hard.Boiled.1992.1080p.BluRay.x265.hevc.10bit.AAC.5.1.commentary-HeVK.mkv"
+
+python make_gifs.py \
+--movie "$movie_path" \
+--subtitleTrack 5 \
+--outputFolder "/mnt/c/Users/marti/Documents/projects/Media-To-Gif/hard_boiled_gifs" \
+--maxFilesize "15mb" \
+--quotes true \
+--saveJson \
+--subtitleColor "white" \
+--subtitleSize 35 \
+--textBorder 3 \
+--textPadding 15 \
+--bottomPadding 20 \
+--uppercase
+```

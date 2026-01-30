@@ -3,3 +3,4 @@ pysrt
 Pillow
 numpy
 ffmpeg-python
+requests

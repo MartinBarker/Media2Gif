@@ -14,3 +14,5 @@ config.cfg
 pip-selfcheck.json
 venv/
 media/
+node_modules 
+hard_boiled_gifs/gifs_metadata.json
