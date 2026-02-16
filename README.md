@@ -1,3 +1,16 @@
+
+
+- Convert an entire movie or TV show to gifs
+# make gifs
+
+# add descriptions
+- CLI args (fresh start)
+
+# upload to giphy
+- create giphy account / collection / fill out .env
+
+
+________________
 # Media-To-Gif
 
 This script takes a movie file and subtitles file as input. It processes the movie to generate GIFs every 5 seconds. If a 5-second interval includes a quote, it generates a GIF of that full quote instead and overlays subtitles onto the GIF. The script downsamples, resizes, changes colors, and adjusts the framerate of the GIF to make it as close to 4MB as possible. The GIF is saved with a filename formatted as `${mediaName}-Start[${startTime}]-End[${endTime}]-Quote[${quote}].gif`, where the variables are:
@@ -259,7 +272,7 @@ movie_path="/mnt/q/movies/Hard Boiled (1992)/Hard.Boiled.1992.1080p.BluRay.x265.
 python make_gifs.py \
 --movie "$movie_path" \
 --subtitleTrack 5 \
---outputFolder "/mnt/c/Users/marti/Documents/projects/Media-To-Gif/hard_boiled_gifs" \
+--outputFolder "/mnt/c/Users/marti/Documents/projects/Media-To-Gif/hard_boiled_gifs_no_transperancy" \
 --maxFilesize "15mb" \
 --quotes true \
 --saveJson \

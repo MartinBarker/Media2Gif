@@ -4,3 +4,8 @@ Pillow
 numpy
 ffmpeg-python
 requests
+# Optional: face recognition for actor identification
+# Requires dlib which may need cmake and a C++ compiler
+# On Windows: pip install cmake, then pip install dlib face_recognition
+# On Linux/Mac: pip install face_recognition
+face_recognition

@@ -16,3 +16,4 @@ venv/
 media/
 node_modules 
 hard_boiled_gifs/gifs_metadata.json
+package-lock.json
