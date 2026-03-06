@@ -8,209 +8,137 @@ Prerequisites:
 3. Make sure Ollama is running: ollama serve
 
 Usage:
-    python add_gif_descriptions.py --folder "hard_boiled_gifs"
-    python add_gif_descriptions.py --folder "hard_boiled_gifs" --model "llava:13b"
-    python add_gif_descriptions.py --folder "hard_boiled_gifs" --skip-existing
+    python add_gif_descriptions.py F1.cfg
+    python add_gif_descriptions.py F1.cfg --model "llava:13b"
+    python add_gif_descriptions.py F1.cfg --skip-existing
+    python add_gif_descriptions.py --folder "/path/to/gifs"
 """
 
 import os
 import json
-import base64
 import argparse
-import requests
-from PIL import Image
-import io
+import configparser
+from describe import (
+    check_ollama_available,
+    describe_gif,
+    find_gif_path,
+    OllamaFatalError,
+)
 
-# Ollama API endpoint (default local)
-OLLAMA_API_URL = "http://localhost:11434/api/generate"
 
-def extract_frame_from_gif(gif_path, frame_index=None):
-    """Extract a frame from a GIF file and return as base64."""
-    try:
-        with Image.open(gif_path) as img:
-            # Get total number of frames
-            n_frames = getattr(img, 'n_frames', 1)
-            
-            # Use middle frame if no specific frame requested
-            if frame_index is None:
-                frame_index = n_frames // 2
-            
-            # Seek to the desired frame
-            img.seek(min(frame_index, n_frames - 1))
-            
-            # Convert to RGB if necessary
-            if img.mode != 'RGB':
-                img = img.convert('RGB')
-            
-            # Save to bytes buffer
-            buffer = io.BytesIO()
-            img.save(buffer, format='JPEG', quality=85)
-            buffer.seek(0)
-            
-            # Return base64 encoded
-            return base64.b64encode(buffer.read()).decode('utf-8')
-    except Exception as e:
-        print(f"Error extracting frame from {gif_path}: {e}")
+def resolve_folder_from_cfg(config_path):
+    """Read a .cfg file and derive the GIF output folder path."""
+    cfg = configparser.ConfigParser()
+    cfg.read(config_path)
+    if 'movie' not in cfg:
+        print(f"Error: No [movie] section found in {config_path}")
         return None
-
-def get_description_from_ollama(image_base64, model="llava"):
-    """Send image to Ollama vision model and get description."""
-    prompt = """Describe what is happening in this image in a short, concise phrase (5-15 words). 
-Focus on the main action or scene. Examples of good descriptions:
-- "man pointing gun at another person"
-- "woman running through rain"
-- "car exploding in street"
-- "two people having intense conversation"
-
-Respond with ONLY the description, nothing else."""
-
-    payload = {
-        "model": model,
-        "prompt": prompt,
-        "images": [image_base64],
-        "stream": False,
-        "options": {
-            "temperature": 0.3,  # Lower temperature for more consistent descriptions
-        }
-    }
-    
-    try:
-        response = requests.post(OLLAMA_API_URL, json=payload, timeout=120)
-        response.raise_for_status()
-        result = response.json()
-        description = result.get('response', '').strip()
-        # Clean up the description - remove quotes if present
-        description = description.strip('"\'')
-        return description
-    except requests.exceptions.ConnectionError:
-        print("Error: Cannot connect to Ollama. Make sure Ollama is running (ollama serve)")
+    section = cfg['movie']
+    movie_path = section.get('movie_path', '').strip()
+    output_folder = section.get('output_folder', 'gifs_output').strip() or 'gifs_output'
+    if not movie_path:
+        print(f"Error: No movie_path set in {config_path}")
         return None
-    except Exception as e:
-        print(f"Error getting description from Ollama: {e}")
-        return None
+    if os.path.isabs(output_folder):
+        return output_folder
+    movie_dir = os.path.dirname(os.path.abspath(movie_path))
+    return os.path.join(movie_dir, output_folder)
 
-def check_ollama_available(model="llava"):
-    """Check if Ollama is running and the model is available."""
-    try:
-        # Check if Ollama is running
-        response = requests.get("http://localhost:11434/api/tags", timeout=5)
-        response.raise_for_status()
-        
-        # Check if the model is available
-        models = response.json().get('models', [])
-        model_names = [m.get('name', '').split(':')[0] for m in models]
-        
-        if model.split(':')[0] not in model_names:
-            print(f"Model '{model}' not found. Available models: {model_names}")
-            print(f"Pull the model with: ollama pull {model}")
-            return False
-        
-        return True
-    except requests.exceptions.ConnectionError:
-        print("Ollama is not running. Start it with: ollama serve")
-        return False
-    except Exception as e:
-        print(f"Error checking Ollama: {e}")
-        return False
 
 def process_gifs_folder(folder_path, model="llava", skip_existing=False):
     """Process all GIFs in a folder and add descriptions to metadata."""
-    
-    # Check if Ollama is available
     if not check_ollama_available(model):
         return
-    
+
     json_path = os.path.join(folder_path, 'gifs_metadata.json')
-    
-    # Load existing metadata
+
     if os.path.exists(json_path):
         with open(json_path, 'r', encoding='utf-8') as f:
             metadata = json.load(f)
     else:
         print(f"No gifs_metadata.json found in {folder_path}")
-        # Try to build metadata from GIF files
         metadata = {}
         for filename in os.listdir(folder_path):
             if filename.endswith('.gif'):
-                metadata[filename] = {
-                    'quote': '',
-                    'startTime': '',
-                    'endTime': ''
-                }
-    
+                metadata[filename] = {'quote': '', 'startTime': '', 'endTime': ''}
+
     total = len(metadata)
     processed = 0
     skipped = 0
-    
+
     print(f"\nProcessing {total} GIFs in {folder_path}...")
     print(f"Using model: {model}")
     print("-" * 60)
-    
+
     for filename, data in metadata.items():
-        # Skip if already has description and skip_existing is True
         if skip_existing and data.get('description'):
             skipped += 1
             continue
-        
-        gif_path = os.path.join(folder_path, filename)
-        
-        # Check if GIF file exists (might be in a batch subfolder)
-        if not os.path.exists(gif_path):
-            # Check batch folders
-            for subfolder in os.listdir(folder_path):
-                subfolder_path = os.path.join(folder_path, subfolder)
-                if os.path.isdir(subfolder_path) and subfolder.startswith('batch_'):
-                    potential_path = os.path.join(subfolder_path, filename)
-                    if os.path.exists(potential_path):
-                        gif_path = potential_path
-                        break
-        
-        if not os.path.exists(gif_path):
-            print(f"⚠ GIF not found: {filename}")
+
+        gif_path = find_gif_path(filename, folder_path)
+        if not gif_path:
+            print(f"  GIF not found: {filename}")
             continue
-        
+
         processed += 1
         print(f"[{processed}/{total}] Processing: {filename[:50]}...")
-        
-        # Extract frame from GIF
-        image_base64 = extract_frame_from_gif(gif_path)
-        if not image_base64:
-            continue
-        
-        # Get description from Ollama
-        description = get_description_from_ollama(image_base64, model)
+
+        try:
+            description = describe_gif(gif_path, model)
+        except OllamaFatalError as e:
+            print(f"\n*** FATAL: {e}")
+            print("*** Stopping.")
+            break
+
         if description:
             data['description'] = description
-            print(f"    → {description}")
-            
-            # Save after each update (in case of interruption)
+            print(f"    -> {description}")
             with open(json_path, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
         else:
-            print(f"    → Failed to get description")
-    
+            print(f"    -> Failed to get description")
+
     print("-" * 60)
     print(f"Done! Processed: {processed}, Skipped: {skipped}")
     print(f"Metadata saved to: {json_path}")
 
+
 def main():
     parser = argparse.ArgumentParser(
-        description='Add AI-generated descriptions to GIF metadata using local Ollama vision model.'
+        description='Add AI-generated descriptions to GIF metadata using local Ollama vision model.',
+        usage='%(prog)s [CONFIG.cfg | --folder PATH] [options]'
     )
-    parser.add_argument('--folder', required=True, 
+    parser.add_argument('config', nargs='?', default=None,
+                        help='Path to a .cfg configuration file (e.g. F1.cfg)')
+    parser.add_argument('--folder', default=None,
                         help='Path to folder containing GIFs and gifs_metadata.json')
     parser.add_argument('--model', default='llava',
-                        help='Ollama vision model to use (default: llava). Options: llava, llava:13b, llava:34b, bakllava')
+                        help='Ollama vision model to use (default: llava)')
     parser.add_argument('--skip-existing', action='store_true',
                         help='Skip GIFs that already have descriptions')
-    
+
     args = parser.parse_args()
-    
-    if not os.path.exists(args.folder):
-        print(f"Error: Folder not found: {args.folder}")
+
+    folder = args.folder
+    if args.config:
+        if not os.path.isfile(args.config):
+            print(f"Error: Config file not found: {args.config}")
+            return
+        folder = resolve_folder_from_cfg(args.config)
+        if not folder:
+            return
+        print(f"Loaded configuration from: {args.config}")
+        print(f"GIF folder: {folder}")
+
+    if not folder:
+        parser.error('Provide a .cfg file or --folder path')
+
+    if not os.path.exists(folder):
+        print(f"Error: Folder not found: {folder}")
         return
-    
-    process_gifs_folder(args.folder, args.model, args.skip_existing)
+
+    process_gifs_folder(folder, args.model, args.skip_existing)
+
 
 if __name__ == '__main__':
     main()

@@ -19,7 +19,7 @@ import pysrt
 import math
 from PIL import Image, ImageDraw, ImageFont
 from numpy import array
-from numpy import array
+import numpy as np
 from PIL import Image, ImageFont, ImageDraw
 from PIL import ImageEnhance  # Add this import
 import shutil  # Add this import for checking ImageMagick availability
@@ -169,34 +169,66 @@ def extract_subtitle_track(movie_path, track_index, output_path=None):
         movie_dir = os.path.dirname(os.path.abspath(movie_path))
         movie_name = os.path.splitext(os.path.basename(movie_path))[0]
         output_path = os.path.join(movie_dir, f".{movie_name}_extracted_track{track_index}.srt")
-    
-    # Check if we already extracted this track
-    if os.path.exists(output_path):
+
+    if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
         print(f"Using cached extracted subtitles: {output_path}")
         return output_path
-    
-    print(f"Extracting subtitle track {track_index}... ", end="", flush=True)
-    
+
+    # Remove stale/corrupt files so ffmpeg doesn't prompt
+    if os.path.exists(output_path):
+        os.remove(output_path)
+
+    total_seconds = get_video_duration(movie_path)
+    print(f"Extracting subtitle track {track_index}...", flush=True)
+
     try:
-        # Use ffmpeg to extract the subtitle track
-        # -c:s copy = copy subtitle stream without re-encoding (much faster)
-        # -an = no audio processing
-        # -vn = no video processing  
-        result = subprocess.run(
-            [ffmpeg_path, '-y', '-i', movie_path, '-map', f'0:{track_index}', '-c:s', 'srt', '-an', '-vn', output_path],
-            capture_output=True, text=True, timeout=60  # 60 second timeout
+        proc = subprocess.Popen(
+            [ffmpeg_path, '-y', '-progress', 'pipe:1', '-i', movie_path,
+             '-map', f'0:{track_index}', '-c:s', 'copy', '-an', '-vn',
+             output_path],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+            text=True
         )
-        if result.returncode == 0 and os.path.exists(output_path):
-            print("done!")
+
+        last_pct = -1
+        deadline = time.time() + 300
+        while proc.poll() is None:
+            if time.time() > deadline:
+                proc.kill()
+                raise subprocess.TimeoutExpired(cmd='ffmpeg', timeout=300)
+            line = proc.stdout.readline()
+            if not line:
+                continue
+            if line.startswith('out_time_ms='):
+                try:
+                    us = int(line.split('=')[1].strip())
+                    elapsed = us / 1_000_000
+                    if total_seconds > 0:
+                        pct = min(int(elapsed / total_seconds * 100), 99)
+                        if pct != last_pct:
+                            print(f"\r  Progress: {pct}%", end="", flush=True)
+                            last_pct = pct
+                except (ValueError, IndexError):
+                    pass
+
+        stderr_output = proc.stderr.read()
+        if proc.returncode == 0 and os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+            print(f"\r  Progress: 100% - done!")
             return output_path
         else:
-            print("failed!")
-            print(f"Warning: Failed to extract subtitle track: {result.stderr}")
+            print(f"\r  Progress: failed!")
+            if os.path.exists(output_path):
+                os.remove(output_path)
+            print(f"Warning: Failed to extract subtitle track: {stderr_output}")
     except subprocess.TimeoutExpired:
-        print("timeout!")
-        print("Warning: Subtitle extraction timed out after 60 seconds")
+        print(f"\r  Progress: timeout!")
+        if os.path.exists(output_path):
+            os.remove(output_path)
+        print("Warning: Subtitle extraction timed out after 5 minutes")
     except Exception as e:
-        print("error!")
+        print(f"\r  Progress: error!")
+        if os.path.exists(output_path):
+            os.remove(output_path)
         print(f"Warning: Could not extract subtitle track: {e}")
     return None
 
@@ -240,6 +272,127 @@ def prompt_subtitle_track_selection(tracks, movie_path):
         save_subtitle_preference(movie_path, selected_track['index'], selected_track)
     
     return selected_track['index'], selected_track
+
+
+def detect_black_bars(movie_path, num_frames=100, threshold=20):
+    """Detect letterbox black bars by sampling random frames from the video.
+
+    Extracts num_frames random frames and checks row-by-row pixel brightness
+    from top and bottom to find consistent black bars.
+
+    Returns (crop_top, crop_bottom) in pixels.
+    """
+    duration = get_video_duration(movie_path)
+    if duration <= 0:
+        print("Warning: Could not determine video duration for crop detection.")
+        return 0, 0
+
+    max_ts = max(2, duration - 1)
+    sample_size = min(num_frames, max_ts - 1)
+    timestamps = sorted(random.sample(range(1, max_ts), sample_size))
+
+    crop_tops = []
+    crop_bottoms = []
+
+    print(f"Detecting black bars: analyzing {len(timestamps)} random frames...")
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        for i, ts in enumerate(timestamps):
+            if (i + 1) % 20 == 0 or i == 0:
+                print(f"  Analyzing frame {i + 1}/{len(timestamps)}...")
+
+            frame_path = os.path.join(tmpdir, f"frame_{i:04d}.png")
+            ts_str = time.strftime('%H:%M:%S', time.gmtime(ts))
+
+            subprocess.call([
+                ffmpeg_path, '-ss', ts_str, '-i', movie_path,
+                '-frames:v', '1', '-pix_fmt', 'rgb24',
+                frame_path
+            ], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+
+            if not os.path.exists(frame_path):
+                continue
+
+            try:
+                img = Image.open(frame_path).convert('RGB')
+                pixels = np.array(img)
+                h, w, _ = pixels.shape
+
+                top_crop = 0
+                for row in range(h):
+                    if np.mean(pixels[row]) < threshold:
+                        top_crop = row + 1
+                    else:
+                        break
+
+                bottom_crop = 0
+                for row in range(h - 1, -1, -1):
+                    if np.mean(pixels[row]) < threshold:
+                        bottom_crop = h - row
+                    else:
+                        break
+
+                crop_tops.append(top_crop)
+                crop_bottoms.append(bottom_crop)
+            except Exception as e:
+                print(f"  Warning: Could not analyze frame at {ts_str}: {e}")
+                continue
+
+    if not crop_tops:
+        print("Warning: Could not analyze any frames for crop detection.")
+        return 0, 0
+
+    crop_top = int(np.median(crop_tops))
+    crop_bottom = int(np.median(crop_bottoms))
+
+    if crop_top < 10:
+        crop_top = 0
+    if crop_bottom < 10:
+        crop_bottom = 0
+
+    print(f"Black bar detection complete:")
+    print(f"  Crop top:    {crop_top}px")
+    print(f"  Crop bottom: {crop_bottom}px")
+    print(f"  Frames analyzed: {len(crop_tops)}")
+
+    return crop_top, crop_bottom
+
+
+def save_crop_preferences(movie_path, crop_top, crop_bottom):
+    """Save crop preferences into the existing subtitle prefs JSON file."""
+    prefs_path = get_subtitle_preferences_path(movie_path)
+    prefs = {}
+    if os.path.exists(prefs_path):
+        try:
+            with open(prefs_path, 'r') as f:
+                prefs = json.load(f)
+        except:
+            pass
+    prefs['crop_top'] = crop_top
+    prefs['crop_bottom'] = crop_bottom
+    try:
+        with open(prefs_path, 'w') as f:
+            json.dump(prefs, f, indent=2)
+        print(f"Crop preferences saved to: {prefs_path}")
+    except Exception as e:
+        print(f"Warning: Could not save crop preferences: {e}")
+
+
+def load_crop_preferences(movie_path):
+    """Load crop preferences from the subtitle prefs JSON file.
+
+    Returns (crop_top, crop_bottom) or (None, None) if not saved.
+    """
+    prefs_path = get_subtitle_preferences_path(movie_path)
+    if os.path.exists(prefs_path):
+        try:
+            with open(prefs_path, 'r') as f:
+                prefs = json.load(f)
+            if 'crop_top' in prefs and 'crop_bottom' in prefs:
+                return prefs['crop_top'], prefs['crop_bottom']
+        except:
+            pass
+    return None, None
 
 
 def draw_text(draw, image_width, image_height, text, font, text_color="white", stroke_width=2, uppercase=False, italicize=False, text_padding=5, bottom_padding=None, subtitle_size=None):
@@ -476,7 +629,7 @@ def get_batch_folder_path(output_dir, gif_index, batch_size):
         os.makedirs(batch_folder)
     return batch_folder
 
-def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslatergifs/', interval=5, start_time_str="00:00:00", max_filesize=None, debug=False, random_times=False, no_hdr=False, boost_colors=0, boost_frame_colors=0, quotes=True, subtitle_color="white", subtitle_size=None, random_quote=False, save_json=False, check_history=False, text_border=2, uppercase=False, italicize=False, max_gifs=None, text_padding=5, bottom_padding=None, trailing_period=True, output_batch_folder_size=None):
+def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslatergifs/', interval=5, start_time_str="00:00:00", max_filesize=None, debug=False, random_times=False, no_hdr=False, boost_colors=0, boost_frame_colors=0, quotes=True, subtitle_color="white", subtitle_size=None, random_quote=False, save_json=False, check_history=False, text_border=2, uppercase=False, italicize=False, max_gifs=None, text_padding=5, bottom_padding=None, trailing_period=True, output_batch_folder_size=None, crop_padding="false", describe=False, describe_model="llava"):
     global WIDTH, HEIGHT, ORIGINAL_HEIGHT
     if not os.path.exists(output_dir):
         os.makedirs(output_dir)
@@ -484,6 +637,27 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
         os.makedirs(SCREENCAP_PATH)
     WIDTH, HEIGHT = get_video_resolution(movie_path)
     ORIGINAL_HEIGHT = HEIGHT  # Store original height for subtitle size calculation
+
+    # Handle crop padding (letterbox black-bar removal)
+    crop_top = 0
+    crop_bottom = 0
+    if isinstance(crop_padding, str) and crop_padding.lower() == "auto":
+        saved_crop_top, saved_crop_bottom = load_crop_preferences(movie_path)
+        if saved_crop_top is not None and saved_crop_bottom is not None:
+            crop_top = saved_crop_top
+            crop_bottom = saved_crop_bottom
+            print(f"Skipping black bar detection (already saved): crop-top={crop_top}px, crop-bottom={crop_bottom}px")
+        else:
+            crop_top, crop_bottom = detect_black_bars(movie_path)
+            if crop_top > 0 or crop_bottom > 0:
+                save_crop_preferences(movie_path, crop_top, crop_bottom)
+            else:
+                save_crop_preferences(movie_path, 0, 0)
+
+        if crop_top > 0 or crop_bottom > 0:
+            HEIGHT = HEIGHT - crop_top - crop_bottom
+            print(f"Adjusted frame height: {ORIGINAL_HEIGHT}px -> {HEIGHT}px "
+                  f"(cropping {crop_top}px top, {crop_bottom}px bottom)")
 
     # If subtitle_size not specified, use default of 20px
     if subtitle_size is None:
@@ -550,8 +724,8 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
     if not subtitle_path:
         # First check if we have a saved preference
         saved_pref = load_subtitle_preference(movie_path)
-        if saved_pref:
-            track_index = saved_pref.get('track_index')
+        if saved_pref and saved_pref.get('track_index') is not None:
+            track_index = saved_pref['track_index']
             track_info = saved_pref.get('track_info', {})
             print(f"Using saved subtitle preference: Track {track_index} ({track_info.get('language', 'unknown')})")
             extracted_path = extract_subtitle_track(movie_path, track_index)
@@ -598,7 +772,28 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
     
     # Counter for tracking number of GIFs created
     gifs_created = 0
-    
+
+    # Set up adaptive AI description if enabled
+    describer = None
+    if describe:
+        if not save_json:
+            save_json = True
+            print("Note: --describe implies --saveJson, enabling JSON metadata.")
+        try:
+            from describe import AdaptiveDescriber, check_ollama_available as _check_ollama
+            if _check_ollama(describe_model):
+                json_path = os.path.join(output_dir, 'gifs_metadata.json')
+                describer = AdaptiveDescriber(
+                    model=describe_model,
+                    json_path=json_path,
+                    metadata=gif_metadata
+                )
+                describer.describe_undescribed(output_dir)
+            else:
+                print("Warning: Ollama not available, skipping AI descriptions.")
+        except ImportError:
+            print("Warning: describe.py not found, skipping AI descriptions.")
+
     # Handle randomQuote flag
     if random_quote:
         if quotes:
@@ -705,6 +900,9 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
                             print("No new GIFs to export. All GIFs already exist in history.")
                         else:
                             for idx, task in enumerate(gif_tasks, 1):
+                                if describer:
+                                    describer.check_fatal()
+
                                 # Check max_gifs limit
                                 if max_gifs is not None and gifs_created >= max_gifs:
                                     print(f"\nReached maximum GIF limit of {max_gifs}. Stopping GIF generation.")
@@ -721,11 +919,13 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
                                     filename = os.path.join(batch_folder, generate_filename(movie_path, task['start_time'], task['end_time'], task['quote']))
                                 else:
                                     filename = os.path.join(output_dir, generate_filename(movie_path, task['start_time'], task['end_time'], task['quote']))
-                                create_gif(movie_path, task['start_time'], task['end_time'], task['quote'], filename, font, max_filesize, debug, no_hdr, boost_colors, boost_frame_colors, subtitle_color, task['has_quote'], subtitle_size, save_json, gif_metadata, output_dir, text_border, uppercase, italicize, text_padding, bottom_padding)
+                                create_gif(movie_path, task['start_time'], task['end_time'], task['quote'], filename, font, max_filesize, debug, no_hdr, boost_colors, boost_frame_colors, subtitle_color, task['has_quote'], subtitle_size, save_json, gif_metadata, output_dir, text_border, uppercase, italicize, text_padding, bottom_padding, crop_top, crop_bottom)
                                 # Only count if GIF was actually created
                                 if os.path.exists(filename):
                                     gifs_created += 1
                                     gif_count += 1
+                                    if describer:
+                                        describer.submit(filename, os.path.basename(filename))
             else:
                 print("Warning: --quotes true specified with --randomQuote but no subtitles file found.")
         else:
@@ -750,11 +950,15 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
                     filename = os.path.join(batch_folder, generate_filename(movie_path, current_time, end_time, quote_text))
                 else:
                     filename = os.path.join(output_dir, generate_filename(movie_path, current_time, end_time, quote_text))
-                create_gif(movie_path, current_time, end_time, quote_text, filename, font, max_filesize, debug, no_hdr, boost_colors, boost_frame_colors, subtitle_color, quotes, subtitle_size, save_json, gif_metadata, output_dir, text_border, uppercase, italicize, text_padding, bottom_padding)
+                create_gif(movie_path, current_time, end_time, quote_text, filename, font, max_filesize, debug, no_hdr, boost_colors, boost_frame_colors, subtitle_color, quotes, subtitle_size, save_json, gif_metadata, output_dir, text_border, uppercase, italicize, text_padding, bottom_padding, crop_top, crop_bottom)
                 # Only count if GIF was actually created
                 if os.path.exists(filename):
                     gifs_created += 1
                     gif_count += 1
+                    if describer:
+                        describer.submit(filename, os.path.basename(filename))
+        if describer:
+            describer.shutdown()
         return
     
     # Original logic for non-randomQuote mode
@@ -764,6 +968,9 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
         start_times = range(sum(int(x) * 60 ** i for i, x in enumerate(reversed(start_time_str.split(":")))), duration, interval)
 
     for current_time in start_times:
+        if describer:
+            describer.check_fatal()
+
         # Check max_gifs limit
         if max_gifs is not None and gifs_created >= max_gifs:
             print(f"\nReached maximum GIF limit of {max_gifs}. Stopping GIF generation.")
@@ -795,11 +1002,16 @@ def generate_gifs(movie_path, subtitle_path=None, output_dir='/mnt/x/28dayslater
         else:
             filename = os.path.join(output_dir, generate_filename(movie_path, current_time, end_time, quote_text))
         
-        create_gif(movie_path, current_time, end_time, quote_text, filename, font, max_filesize, debug, no_hdr, boost_colors, boost_frame_colors, subtitle_color, quotes, subtitle_size, save_json, gif_metadata, output_dir, text_border, uppercase, italicize, text_padding, bottom_padding)
+        create_gif(movie_path, current_time, end_time, quote_text, filename, font, max_filesize, debug, no_hdr, boost_colors, boost_frame_colors, subtitle_color, quotes, subtitle_size, save_json, gif_metadata, output_dir, text_border, uppercase, italicize, text_padding, bottom_padding, crop_top, crop_bottom)
         # Only count if GIF was actually created
         if os.path.exists(filename):
             gifs_created += 1
             gif_count += 1
+            if describer:
+                describer.submit(filename, os.path.basename(filename))
+
+    if describer:
+        describer.shutdown()
 
 def get_video_duration(movie_path):
     result = subprocess.run(
@@ -859,7 +1071,7 @@ def generate_filename(movie_path, start_time, end_time, quote):
     return f"{media_name}-Start[{start_str}]-End[{end_str}]-Quote[{quote_str}].gif"
 
 
-def create_gif(movie_path, start_time, end_time, quote, filename, font, max_filesize, debug, no_hdr=False, boost_colors=0, boost_frame_colors=0, subtitle_color="white", quotes=True, subtitle_size=None, save_json=False, gif_metadata=None, output_dir=None, text_border=2, uppercase=False, italicize=False, text_padding=5, bottom_padding=None):
+def create_gif(movie_path, start_time, end_time, quote, filename, font, max_filesize, debug, no_hdr=False, boost_colors=0, boost_frame_colors=0, subtitle_color="white", quotes=True, subtitle_size=None, save_json=False, gif_metadata=None, output_dir=None, text_border=2, uppercase=False, italicize=False, text_padding=5, bottom_padding=None, crop_top=0, crop_bottom=0):
     images = []
     duration = end_time - start_time
     
@@ -877,7 +1089,10 @@ def create_gif(movie_path, start_time, end_time, quote, filename, font, max_file
             os.remove(file_path)
 
     # Build ffmpeg filter chain
-    filters = [f"scale={WIDTH}:{HEIGHT}"]
+    filters = []
+    if crop_top > 0 or crop_bottom > 0:
+        filters.append(f"crop=in_w:in_h-{crop_top}-{crop_bottom}:0:{crop_top}")
+    filters.append(f"scale={WIDTH}:{HEIGHT}")
     if no_hdr:
         # Remove HDR by converting to SDR (simple tonemap)
         filters.append("zscale=t=linear:npl=100,format=rgb24")
@@ -1034,8 +1249,13 @@ def optimize_gif(filename, max_filesize_bytes, debug):
 
 if __name__ == '__main__':
 
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--movie', type=str, required=True, help='Path to the movie file')
+    parser = argparse.ArgumentParser(
+        description='Convert video files to GIFs with optional subtitle overlays.',
+        usage='%(prog)s [CONFIG.cfg] [--movie PATH] [options]'
+    )
+    parser.add_argument('config', nargs='?', default=None,
+                        help='Path to a .cfg configuration file (e.g. F1.cfg)')
+    parser.add_argument('--movie', type=str, default=None, help='Path to the movie file')
     parser.add_argument('--subtitles', type=str, help='Path to the subtitles file (optional)')
     parser.add_argument('--outputFolder', type=str, default='/mnt/x/28dayslatergifs/', help='Output directory for GIFs. If relative path, creates folder in same directory as movie file.')
     parser.add_argument('--interval', type=int, default=5, help='Interval in seconds for GIF generation')
@@ -1098,9 +1318,86 @@ if __name__ == '__main__':
     parser.add_argument('--italicize', action='store_true', default=False, help='Italicize the text (default: false)')
     parser.add_argument('--trailingPeriod', type=str_to_bool, default=True, help='Keep trailing periods in quotes (true/false). Set to false to remove trailing periods from all quotes (default: true)')
     parser.add_argument('--outputBatchFolderSize', type=int, default=None, help='Automatically organize GIFs into batch folders of specified size (e.g., 100). GIFs are saved directly into batch_001, batch_002, etc. folders as they are created (default: None, saves all GIFs in output folder)')
+    parser.add_argument('--cropPadding', type=str, default='false', help='Remove letterbox black bars. "false" = no cropping (default). "auto" = sample 100 frames and auto-detect black bars, saving crop values to prefs JSON.')
     parser.add_argument('--subtitleTrack', type=int, default=None, help='Specify which embedded subtitle track to use by index (use --listSubtitleTracks to see available tracks)')
+    parser.add_argument('--describe', action='store_true', help='Use Ollama AI to describe each GIF in background threads as they are created (requires ollama serve)')
+    parser.add_argument('--describeModel', type=str, default='llava', help='Ollama vision model for --describe (default: llava)')
+    parser.add_argument('--fresh', action='store_true', help='Nuclear reset: delete GIFs, metadata JSON, extracted SRTs, and subtitle/crop prefs before starting')
+    parser.add_argument('--freshGifs', action='store_true', help='Delete only the GIF output folder (keeps extracted SRTs and crop/subtitle prefs)')
     parser.add_argument('--listSubtitleTracks', action='store_true', help='List all available subtitle tracks in the video file and exit')
+
+    # ---- Load .cfg file defaults (CLI flags always override) ----
+    _pre = argparse.ArgumentParser(add_help=False)
+    _pre.add_argument('_cfg', nargs='?', default=None)
+    _pre_args, _ = _pre.parse_known_args()
+
+    if _pre_args._cfg and os.path.isfile(_pre_args._cfg):
+        _cfg = configparser.ConfigParser()
+        _cfg.read(_pre_args._cfg)
+        if 'movie' in _cfg:
+            _s = _cfg['movie']
+            _d = {}
+
+            def _cfg_str(key):
+                v = _s.get(key, '').strip()
+                return v if v else None
+
+            def _cfg_bool(key):
+                v = _cfg_str(key)
+                return v.lower() in ('true', 'yes', '1', 't', 'y') if v else None
+
+            def _cfg_int(key):
+                v = _cfg_str(key)
+                if v is None:
+                    return None
+                try:
+                    return int(v)
+                except ValueError:
+                    return None
+
+            if _cfg_str('movie_path'):                              _d['movie'] = _cfg_str('movie_path')
+            if _cfg_str('subtitle_path'):                           _d['subtitles'] = _cfg_str('subtitle_path')
+            if _cfg_int('subtitle_track') is not None:              _d['subtitleTrack'] = _cfg_int('subtitle_track')
+            if _cfg_str('output_folder'):                           _d['outputFolder'] = _cfg_str('output_folder')
+            if _cfg_int('output_batch_folder_size') is not None:    _d['outputBatchFolderSize'] = _cfg_int('output_batch_folder_size')
+            if _cfg_int('interval') is not None:                    _d['interval'] = _cfg_int('interval')
+            if _cfg_str('start_time'):                              _d['startTime'] = _cfg_str('start_time')
+            if _cfg_int('max_gifs') is not None:                    _d['maxGifs'] = _cfg_int('max_gifs')
+            if _cfg_bool('random_times') is not None:               _d['randomTimes'] = _cfg_bool('random_times')
+            if _cfg_bool('random_quote') is not None:               _d['randomQuote'] = _cfg_bool('random_quote')
+            if _cfg_bool('quotes') is not None:                     _d['quotes'] = _cfg_bool('quotes')
+            if _cfg_str('subtitle_color'):                          _d['subtitleColor'] = _cfg_str('subtitle_color')
+            if _cfg_int('subtitle_size') is not None:               _d['subtitleSize'] = _cfg_int('subtitle_size')
+            if _cfg_int('text_border') is not None:                 _d['textBorder'] = _cfg_int('text_border')
+            if _cfg_int('text_padding') is not None:                _d['textPadding'] = _cfg_int('text_padding')
+            if _cfg_int('bottom_padding') is not None:              _d['bottomPadding'] = _cfg_int('bottom_padding')
+            if _cfg_bool('uppercase') is not None:                  _d['uppercase'] = _cfg_bool('uppercase')
+            if _cfg_bool('italicize') is not None:                  _d['italicize'] = _cfg_bool('italicize')
+            if _cfg_bool('trailing_period') is not None:            _d['trailingPeriod'] = _cfg_bool('trailing_period')
+            if _cfg_str('max_filesize'):
+                try:
+                    _d['maxFilesize'] = parse_filesize(_cfg_str('max_filesize'))
+                except Exception:
+                    pass
+            if _cfg_bool('no_hdr') is not None:                     _d['noHDR'] = _cfg_bool('no_hdr')
+            if _cfg_int('boost_colors') is not None:                _d['boostColors'] = _cfg_int('boost_colors')
+            if _cfg_int('boost_frame_colors') is not None:          _d['boostFrameColors'] = _cfg_int('boost_frame_colors')
+            if _cfg_str('crop_padding'):                            _d['cropPadding'] = _cfg_str('crop_padding')
+            if _cfg_bool('describe') is not None:                   _d['describe'] = _cfg_bool('describe')
+            if _cfg_str('describe_model'):                          _d['describeModel'] = _cfg_str('describe_model')
+            if _cfg_bool('save_json') is not None:                  _d['saveJson'] = _cfg_bool('save_json')
+            if _cfg_bool('check_history') is not None:              _d['checkHistory'] = _cfg_bool('check_history')
+            if _cfg_bool('debug') is not None:                      _d['debug'] = _cfg_bool('debug')
+
+            parser.set_defaults(**_d)
+            print(f"Loaded configuration from: {_pre_args._cfg}")
+    elif _pre_args._cfg:
+        print(f"Warning: Config file not found: {_pre_args._cfg}")
+
     args = parser.parse_args()
+
+    if not args.movie:
+        parser.error('--movie is required (either via CLI or in a .cfg file)')
 
     # Handle --listSubtitleTracks: list tracks and exit
     if args.listSubtitleTracks:
@@ -1148,6 +1445,82 @@ if __name__ == '__main__':
         movie_dir = os.path.dirname(os.path.abspath(args.movie))
         output_dir = os.path.join(movie_dir, output_dir)
 
+    if args.fresh:
+        print("Fresh run: cleaning up previous outputs...")
+        movie_dir = os.path.dirname(os.path.abspath(args.movie))
+        movie_name = os.path.splitext(os.path.basename(args.movie))[0]
+
+        # 1. Delete _subtitle_prefs.json
+        prefs_path = get_subtitle_preferences_path(args.movie)
+        if os.path.exists(prefs_path):
+            os.remove(prefs_path)
+            print(f"  Deleted prefs:    {prefs_path}")
+        else:
+            print(f"  No prefs file:    {prefs_path}")
+
+        # 2. Delete extracted .srt files
+        srt_pattern = f".{movie_name}_extracted_track"
+        found_srt = False
+        for f in os.listdir(movie_dir):
+            if f.startswith(srt_pattern) and f.endswith('.srt'):
+                srt_path = os.path.join(movie_dir, f)
+                os.remove(srt_path)
+                print(f"  Deleted srt:      {srt_path}")
+                found_srt = True
+        if not found_srt:
+            print(f"  No extracted srt files found")
+
+        # 3. Delete gifs_output folder contents
+        if os.path.exists(output_dir):
+            removed_gifs = 0
+            removed_json = 0
+            removed_dirs = 0
+            for root, dirs, files in os.walk(output_dir, topdown=False):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if f.endswith('.gif') or f.endswith('.json'):
+                        os.remove(fp)
+                        if f.endswith('.gif'):
+                            removed_gifs += 1
+                        else:
+                            removed_json += 1
+                if root != output_dir:
+                    try:
+                        os.rmdir(root)
+                        removed_dirs += 1
+                    except OSError:
+                        pass
+            print(f"  Deleted output:   {removed_gifs} GIFs, {removed_json} JSON files, {removed_dirs} batch folders from {output_dir}")
+        else:
+            print(f"  No output folder: {output_dir}")
+        print()
+
+    elif args.freshGifs:
+        print("Fresh GIFs: cleaning up output folder only...")
+        if os.path.exists(output_dir):
+            removed_gifs = 0
+            removed_json = 0
+            removed_dirs = 0
+            for root, dirs, files in os.walk(output_dir, topdown=False):
+                for f in files:
+                    fp = os.path.join(root, f)
+                    if f.endswith('.gif') or f.endswith('.json'):
+                        os.remove(fp)
+                        if f.endswith('.gif'):
+                            removed_gifs += 1
+                        else:
+                            removed_json += 1
+                if root != output_dir:
+                    try:
+                        os.rmdir(root)
+                        removed_dirs += 1
+                    except OSError:
+                        pass
+            print(f"  Deleted output:   {removed_gifs} GIFs, {removed_json} JSON files, {removed_dirs} batch folders from {output_dir}")
+        else:
+            print(f"  No output folder: {output_dir}")
+        print()
+
     generate_gifs(
         args.movie,
         subtitle_path_from_track or args.subtitles,
@@ -1173,5 +1546,8 @@ if __name__ == '__main__':
         args.textPadding,
         args.bottomPadding,
         args.trailingPeriod,
-        args.outputBatchFolderSize
+        args.outputBatchFolderSize,
+        args.cropPadding,
+        args.describe,
+        args.describeModel
     )

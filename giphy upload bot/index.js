@@ -113,6 +113,70 @@ function toXPathLiteral(str) {
   return `concat('${str.split("'").join("', \"'\", '")}')`;
 }
 
+// ---------------------------------------------------------------------------
+// Reliably type into a React-controlled input without dropping characters.
+// Uses execCommand('insertText') which fires the proper synthetic events.
+// ---------------------------------------------------------------------------
+async function typeReliably(page, element, text) {
+  await element.click({ clickCount: 3 });
+  await page.waitForTimeout(300);
+  await page.evaluate((el, val) => {
+    el.focus();
+    document.execCommand('selectAll', false, null);
+    document.execCommand('insertText', false, val);
+  }, element, text);
+  await page.waitForTimeout(500);
+}
+
+// ---------------------------------------------------------------------------
+// Poll the page every 3 minutes until the "Open Channel" link appears,
+// logging "Uploading x of y" status on each check.
+// ---------------------------------------------------------------------------
+async function waitForUploadCompletion(page) {
+  const CHECK_INTERVAL_MS = 3 * 60 * 1000; // 3 minutes
+  const MAX_TOTAL_WAIT_MS = 90 * 60 * 1000; // 90-minute safety cap
+  const startTime = Date.now();
+
+  console.log('Monitoring upload progress (will check every 3 minutes)...');
+
+  // Brief pause so the upload request has time to register before first check
+  await page.waitForTimeout(15_000);
+
+  while (Date.now() - startTime < MAX_TOTAL_WAIT_MS) {
+    // ---- Check for "Open Channel" anchor --------------------------------
+    const done = await page.evaluate(() =>
+      Array.from(document.querySelectorAll('a'))
+        .some(a => a.textContent.trim() === 'Open Channel')
+    ).catch(() => false);
+
+    if (done) {
+      console.log('  "Open Channel" button detected — all uploads complete!');
+      return;
+    }
+
+    // ---- Read current "Uploading x of y" progress text ------------------
+    const progressText = await page.evaluate(() => {
+      for (const s of document.querySelectorAll('span')) {
+        if (/Uploading\s+\d+\s+of\s+\d+/i.test(s.textContent || '')) {
+          return s.textContent.trim();
+        }
+      }
+      return null;
+    }).catch(() => null);
+
+    const elapsed = Math.round((Date.now() - startTime) / 60_000);
+    if (progressText) {
+      console.log(`  [${elapsed}m elapsed] ${progressText} — checking again in 3 minutes...`);
+    } else {
+      console.log(`  [${elapsed}m elapsed] No upload progress text visible yet — checking again in 3 minutes...`);
+    }
+
+    await page.waitForTimeout(CHECK_INTERVAL_MS);
+  }
+
+  console.log('  Max wait time (90 min) reached, proceeding anyway.');
+}
+
 // Main function
 async function main() {
   console.log('Launching browser...');
